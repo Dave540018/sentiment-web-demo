@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Offline Sentiment (ONNX + Tokenizer in Browser)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Minimal, clean styling -->
+  <style>
+    :root { --bg:#0f1115; --card:#171923; --text:#e7eaf0; --muted:#a9b3c7; --accent:#6ee7b7; --bad:#f87171; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif; background:var(--bg); color:var(--text); }
+    .wrap { max-width: 860px; margin: 40px auto; padding: 0 16px; }
+    .card { background: var(--card); border: 1px solid #23273a; border-radius: 14px; padding: 20px; }
+    h1 { font-size: 22px; margin: 0 0 12px; }
+    p  { color: var(--muted); margin: 6px 0 14px; }
+    textarea { width: 100%; min-height: 120px; background: #0c0e14; color: var(--text); border: 1px solid #24283a; border-radius: 10px; padding: 12px 14px; resize: vertical; }
+    .row { display: flex; gap: 12px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+    button { background: #2563eb; color: white; border: none; padding: 10px 16px; border-radius: 10px; cursor: pointer; font-weight: 600; }
+    button:disabled { opacity: .6; cursor: progress; }
+    .small { font-size: 12px; color: var(--muted); }
+    .pill { display:inline-block; padding: 6px 10px; border-radius: 999px; font-weight: 700; }
+    .good { background: rgba(110,231,183,.15); color: var(--accent); border: 1px solid rgba(110,231,183,.35); }
+    .bad  { background: rgba(248,113,113,.15); color: var(--bad);    border: 1px solid rgba(248,113,113,.35); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .footer { margin-top: 18px; display:flex; gap:12px; align-items:center; flex-wrap: wrap; }
+    .grid { display:grid; grid-template-columns: 1fr; gap:10px; }
+    @media (min-width:720px){ .grid { grid-template-columns: 1fr 1fr; } }
+    .field { padding:10px 12px; background:#0c0e14; border:1px solid #24283a; border-radius:10px; }
+    .field b { display:block; margin-bottom:6px; color:#b7c1d6; font-size:12px; }
+    .hidden { display:none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Sentiment (GOOD/BAD) — Offline, in your browser</h1>
+      <p>Loads <span class="mono">./onnx-sentiment/model.onnx</span> and <span class="mono">tokenizer.json</span> locally. No server calls.</p>
+
+      <div class="grid">
+        <div>
+          <textarea id="text" placeholder="Type a sentence… e.g. ‘This feature is amazing!’"></textarea>
+          <div class="row">
+            <button id="runBtn">Analyze</button>
+            <span id="status" class="small">Model not loaded yet…</span>
+          </div>
+          <div class="footer">
+            <span id="verdict" class="pill hidden"></span>
+            <span id="score" class="mono small"></span>
+          </div>
+        </div>
+
+        <div class="field">
+          <b>Debug (shapes)</b>
+          <div class="small mono">
+            input_ids: <span id="shape_ids">–</span><br/>
+            attention_mask: <span id="shape_mask">–</span><br/>
+            outputs: <span id="outs">–</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- onnxruntime-web (WASM) -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+  <!-- Hugging Face tokenizers (WASM-backed JS) -->
+  <script src="https://cdn.jsdelivr.net/npm/@huggingface/tokenizers@0.15.1/dist/tokenizers.min.js"></script>
+
+  <script>
+    // -------------------- config you can tweak --------------------
+    const MODEL_PATH = 'D:\GX\CodeLoad\python\Project1-Bst_TextRateModel\onnx-sentiment\model.onnx';
+    const TOKENIZER_JSON = 'D:\GX\CodeLoad\python\Project1-Bst_TextRateModel\onnx-sentiment\tokenizer.json'; // exported with your model
+    const MAX_LEN = 128; // truncate/pad length
+
+    // -------------------- utils --------------------
+    const softmax = (arr) => {
+      const max = Math.max(...arr);
+      const exps = arr.map(v => Math.exp(v - max));
+      const sum  = exps.reduce((a,b)=>a+b,0);
+      return exps.map(v => v/sum);
+    };
+
+    const padLeft = (arr, len, pad = 0) => {
+      if (arr.length >= len) return arr.slice(0, len);
+      const diff = len - arr.length;
+      return arr.concat(Array(diff).fill(pad)); // pad right
+    };
+
+    const $ = (id) => document.getElementById(id);
+    const setStatus = (msg) => $('status').textContent = msg;
+
+    // -------------------- globals --------------------
+    let session = null;
+    let tokenizer = null;
+
+    async function loadAll() {
+      try {
+        setStatus('Loading tokenizer…');
+        const tokJson = await fetch(TOKENIZER_JSON).then(r => r.text());
+        tokenizer = tokenizers.Tokenizer.fromString(tokJson);
+
+        setStatus('Loading ONNX model…');
+        session = await ort.InferenceSession.create(MODEL_PATH, {
+          executionProviders: ['wasm'] // runs everywhere
+        });
+
+        setStatus('Ready ✓');
+        $('runBtn').disabled = false;
+      } catch (e) {
+        console.error(e);
+        setStatus('Failed to load model/tokenizer. Check paths.');
+        $('runBtn').disabled = true;
+      }
+    }
+
+    async function predict() {
+      const text = $('text').value.trim();
+      if (!text) return;
+
+      $('runBtn').disabled = true; setStatus('Encoding…');
+
+      // Encode with tokenizer (returns ids + attention mask)
+      // Ensure special tokens are added; cap to MAX_LEN
+      const enc = tokenizer.encode(text);
+      let ids = enc.ids.slice(0, MAX_LEN);
+      let mask = enc.attentionMask.slice(0, MAX_LEN);
+      ids = padLeft(ids, MAX_LEN, 0);
+      mask = padLeft(mask, MAX_LEN, 0);
+
+      // Debug shapes
+      $('shape_ids').textContent  = `[1, ${ids.length}]`;
+      $('shape_mask').textContent = `[1, ${mask.length}]`;
+
+      // ONNX expects int64 (BigInt64Array) for BERT-like models
+      const ids64  = new BigInt64Array(ids.map(x => BigInt(x)));
+      const mask64 = new BigInt64Array(mask.map(x => BigInt(x)));
+
+      const feeds = {};
+      // Common input names for HF exports:
+      // - "input_ids", "attention_mask" (often enough for DistilBERT)
+      feeds['input_ids'] = new ort.Tensor('int64', ids64,  [1, ids.length]);
+      feeds['attention_mask'] = new ort.Tensor('int64', mask64, [1, mask.length]);
+
+      setStatus('Running inference…');
+      const output = await session.run(feeds);
+
+      // Find logits tensor (name often 'logits')
+      const outNames = Object.keys(output);
+      $('outs').textContent = outNames.join(', ');
+      const logitsName = outNames.find(n => n.toLowerCase().includes('logits')) || outNames[0];
+      const logits = Array.from(output[logitsName].data); // Float32Array -> JS array
+
+      // Binary model: [neg, pos]
+      const probs = softmax(logits);
+      const pPos = probs[1] ?? probs[0] ?? 0.5;
+
+      // UI
+      const verdictEl = $('verdict');
+      verdictEl.classList.remove('hidden','good','bad');
+      if (pPos >= 0.5) { verdictEl.textContent = 'GOOD'; verdictEl.classList.add('good'); }
+      else { verdictEl.textContent = 'BAD'; verdictEl.classList.add('bad'); }
+      $('score').textContent = `score: ${pPos.toFixed(3)}`;
+
+      setStatus('Done ✓');
+      $('runBtn').disabled = false;
+    }
+
+    $('runBtn').addEventListener('click', predict);
+
+    // Auto-load on first paint
+    loadAll();
+  </script>
+</body>
+</html>
